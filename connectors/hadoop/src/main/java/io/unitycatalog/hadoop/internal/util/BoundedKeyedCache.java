@@ -41,7 +41,8 @@ public final class BoundedKeyedCache<K, V> {
    * otherwise loads a fresh value and caches it. A cached-but-rejected value (e.g. an expiring
    * credential) is treated as a miss. Loads are single-flight per key: the thread holding the key
    * lock loads while same-key waiters block briefly and reuse its result; threads on different keys
-   * never block each other.
+   * never block each other. Loaders must not call back into this cache: a loader that loads other
+   * keys can form a lock cycle and deadlock.
    */
   public <E extends Exception> V getOrLoad(
       K key, Predicate<V> isValid, CheckedSupplier<V, E> loader) throws E {

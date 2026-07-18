@@ -314,4 +314,105 @@ class BoundedKeyedCacheTest {
       executor.shutdownNow();
     }
   }
+
+  @Test
+  void stressExactlyOneLoadPerKeyPerGeneration() throws Exception {
+    int keys = 8;
+    int threads = 32;
+    int generations = 5;
+    BoundedKeyedCache<String, Integer> cache = new BoundedKeyedCache<>(keys);
+    ExecutorService executor = Executors.newFixedThreadPool(threads);
+    try {
+      for (int gen = 0; gen < generations; gen++) {
+        int generation = gen;
+        // Every earlier-generation value is stale, so each key needs exactly one reload.
+        Predicate<Integer> isCurrent = value -> value == generation;
+        AtomicInteger[] loadsPerKey = new AtomicInteger[keys];
+        for (int k = 0; k < keys; k++) {
+          loadsPerKey[k] = new AtomicInteger();
+        }
+        CyclicBarrier startBarrier = new CyclicBarrier(threads);
+
+        List<Future<?>> futures = new ArrayList<>();
+        for (int t = 0; t < threads; t++) {
+          int seed = t;
+          futures.add(
+              executor.submit(
+                  () -> {
+                    startBarrier.await(10, TimeUnit.SECONDS);
+                    for (int i = 0; i < keys; i++) {
+                      int k = (i + seed) % keys;
+                      Integer value =
+                          cache.getOrLoad(
+                              "key-" + k,
+                              isCurrent,
+                              () -> {
+                                loadsPerKey[k].incrementAndGet();
+                                return generation;
+                              });
+                      assertThat(value).isEqualTo(generation);
+                    }
+                    return null;
+                  }));
+        }
+        for (Future<?> f : futures) {
+          f.get(30, TimeUnit.SECONDS);
+        }
+        for (int k = 0; k < keys; k++) {
+          assertThat(loadsPerKey[k])
+              .as("generation %s key %s must load exactly once", generation, k)
+              .hasValue(1);
+          assertThat(cache.getIfPresent("key-" + k)).isEqualTo(generation);
+        }
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void loaderFailuresUnderContentionEventuallyRecover() throws Exception {
+    int threads = 16;
+    int failuresBeforeSuccess = 3;
+    BoundedKeyedCache<String, String> cache = new BoundedKeyedCache<>(2);
+    cache.put("k", "stale");
+    AtomicInteger attempts = new AtomicInteger();
+    Predicate<String> isFresh = value -> value.equals("fresh");
+
+    ExecutorService executor = Executors.newFixedThreadPool(threads);
+    try {
+      List<Future<String>> futures = new ArrayList<>();
+      for (int t = 0; t < threads; t++) {
+        futures.add(
+            executor.submit(
+                () -> {
+                  // Retry on loader failure; the per-key lock must be released after each throw
+                  // or the retries (and every other thread) would deadlock instead of recovering.
+                  for (int i = 0; i < 100; i++) {
+                    try {
+                      return cache.getOrLoad(
+                          "k",
+                          isFresh,
+                          () -> {
+                            if (attempts.incrementAndGet() <= failuresBeforeSuccess) {
+                              throw new IOException("transient loader failure");
+                            }
+                            return "fresh";
+                          });
+                    } catch (IOException retryable) {
+                      // Loser of this round; retry.
+                    }
+                  }
+                  throw new IllegalStateException("no success after bounded retries");
+                }));
+      }
+      for (Future<String> f : futures) {
+        assertThat(f.get(30, TimeUnit.SECONDS)).isEqualTo("fresh");
+      }
+      assertThat(attempts.get()).isEqualTo(failuresBeforeSuccess + 1);
+      assertThat(cache.getIfPresent("k")).isEqualTo("fresh");
+    } finally {
+      executor.shutdownNow();
+    }
+  }
 }
