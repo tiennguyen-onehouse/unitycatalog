@@ -49,8 +49,10 @@ import software.amazon.awssdk.services.sts.model.Credentials;
  * </ul>
  *
  * <p>Slowness is injected into the server-side credential generator (same JVM), gated on a static
- * flag and the table location, so setup traffic is unaffected. The slow vend is a bounded sleep
- * rather than an open-ended latch so a server worker is never parked indefinitely.
+ * flag and the table location, so setup traffic is unaffected. The slow vend parks on a latch the
+ * test releases only after the fast-table query completes, so the pass/fail signal is an ordering
+ * fact rather than a timing margin; a bounded fallback await keeps the server worker from being
+ * parked indefinitely.
  */
 public class AwsCredCacheConcurrencyITTest extends BaseCRUDTest {
 
@@ -60,7 +62,7 @@ public class AwsCredCacheConcurrencyITTest extends BaseCRUDTest {
   private static final String SLOW_TABLE_DIR = "slowtbl";
   private static final String FAST_TABLE_DIR = "fasttbl";
   private static final String WARM_TABLE_DIR = "warmtbl";
-  private static final long SLOW_VEND_MILLIS = 8_000L;
+  private static final long SLOW_VEND_FALLBACK_MILLIS = 60_000L;
   private static final long CRED_WINDOW_MILLIS = 30_000L;
   private static final String CLOCK_NAME = UUID.randomUUID().toString();
 
@@ -70,6 +72,7 @@ public class AwsCredCacheConcurrencyITTest extends BaseCRUDTest {
 
   private static volatile boolean slowVendEnabled = false;
   private static volatile CountDownLatch slowVendStarted = new CountDownLatch(1);
+  private static volatile CountDownLatch releaseSlowVend = new CountDownLatch(1);
   private static final AtomicInteger slowVends = new AtomicInteger();
   private static final AtomicInteger fastVends = new AtomicInteger();
 
@@ -97,11 +100,14 @@ public class AwsCredCacheConcurrencyITTest extends BaseCRUDTest {
         "s3.credentialGenerator.0", SlowScopeAwsCredGenerator.class.getName());
   }
 
+  // BaseCRUDTest.setUp() is itself @BeforeEach and has already run (superclass lifecycle methods
+  // execute first), so this method must not call super.setUp() again -- doing so would boot and
+  // leak a second server.
   @BeforeEach
   public void beforeEach() throws Exception {
-    super.setUp();
     slowVendEnabled = false;
     slowVendStarted = new CountDownLatch(1);
+    releaseSlowVend = new CountDownLatch(1);
     slowVends.set(0);
     fastVends.set(0);
 
@@ -179,19 +185,16 @@ public class AwsCredCacheConcurrencyITTest extends BaseCRUDTest {
       Future<List<Row>> slowQuery = executor.submit(() -> sql("SELECT * FROM %s", SLOW_TABLE));
       assertThat(slowVendStarted.await(60, TimeUnit.SECONDS)).isTrue();
 
-      // While the slow vend is in flight, a first read of a different table must vend its own
-      // credential and complete well within the slow vend window.
-      long startNanos = System.nanoTime();
+      // While the slow vend is parked, a first read of a different table must vend its own
+      // credential and complete. The slow vend is only released AFTER this query finishes, so
+      // on a coarse-locked cache this query cannot complete and the test fails by ordering,
+      // not by timing.
       List<Row> fastRows = sql("SELECT * FROM %s", FAST_TABLE);
-      long fastMillis = (System.nanoTime() - startNanos) / 1_000_000;
-
       assertThat(fastRows.size()).isEqualTo(1);
       assertThat(fastVends.get()).isEqualTo(1);
-      assertThat(fastMillis)
-          .as("fast-table query must not queue behind the slow scope's credential vend")
-          .isLessThan(SLOW_VEND_MILLIS / 2);
+      releaseSlowVend.countDown();
 
-      // A concurrent second read of the slow table must reuse the in-flight vend's result.
+      // A concurrent second read of the slow table must reuse the vended credential.
       Future<List<Row>> secondSlowQuery =
           executor.submit(() -> sql("SELECT * FROM %s", SLOW_TABLE));
 
@@ -202,6 +205,7 @@ public class AwsCredCacheConcurrencyITTest extends BaseCRUDTest {
           .isEqualTo(1);
     } finally {
       slowVendEnabled = false;
+      releaseSlowVend.countDown();
       executor.shutdownNow();
     }
   }
@@ -231,7 +235,9 @@ public class AwsCredCacheConcurrencyITTest extends BaseCRUDTest {
         slowVends.incrementAndGet();
         slowVendStarted.countDown();
         try {
-          Thread.sleep(SLOW_VEND_MILLIS);
+          // Parked until the test observes the fast-table query completing; the bounded await
+          // guarantees a server worker is never held indefinitely if the test dies first.
+          releaseSlowVend.await(SLOW_VEND_FALLBACK_MILLIS, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
         }

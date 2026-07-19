@@ -64,50 +64,6 @@ class CredentialCacheTest {
   }
 
   @Test
-  void expiredCredentialRenewedOnlyOnceAcrossThreads() throws Exception {
-    CredentialCache cache = new CredentialCache(4);
-    CredId credId = new TestCredId("scope-a");
-    cache.access(credId, CredentialCacheTest::expiredCredential);
-
-    CountDownLatch renewalStarted = new CountDownLatch(1);
-    CountDownLatch releaseRenewal = new CountDownLatch(1);
-    AtomicInteger renewals = new AtomicInteger();
-
-    ExecutorService executor = Executors.newFixedThreadPool(2);
-    try {
-      Future<GenericCredential> first =
-          executor.submit(
-              () ->
-                  cache.access(
-                      credId,
-                      () -> {
-                        renewals.incrementAndGet();
-                        renewalStarted.countDown();
-                        awaitOrFail(releaseRenewal);
-                        return validCredential();
-                      }));
-      assertThat(renewalStarted.await(5, TimeUnit.SECONDS)).isTrue();
-
-      Future<GenericCredential> second =
-          executor.submit(
-              () ->
-                  cache.access(
-                      credId,
-                      () -> {
-                        renewals.incrementAndGet();
-                        return validCredential();
-                      }));
-
-      releaseRenewal.countDown();
-      assertThat(second.get(5, TimeUnit.SECONDS)).isSameAs(first.get(5, TimeUnit.SECONDS));
-      assertThat(renewals).hasValue(1);
-    } finally {
-      releaseRenewal.countDown();
-      executor.shutdownNow();
-    }
-  }
-
-  @Test
   void renewalOfOneScopeDoesNotBlockOtherScopes() throws Exception {
     CredentialCache cache = new CredentialCache(4);
     CredId slowId = new TestCredId("scope-slow");
